@@ -2,6 +2,16 @@
 
 API REST para recibir lecturas de aire del ESP32 mediante el Python Collector, guardarlas en PostgreSQL de Supabase y exponerlas al frontend.
 
+## URL base de producción
+
+La API desplegada en Vercel es el servicio que deben consumir el Python Collector y el frontend:
+
+```text
+https://kiqtzal-backend.vercel.app
+```
+
+Todas las rutas de la API comienzan con `/api`. No debe usarse `localhost` en el Collector ni en el frontend: `http://localhost:3001` queda reservado para desarrollo local.
+
 ## Requisitos
 
 - Node.js >= 20.19
@@ -49,23 +59,47 @@ npm run build
 npm start
 ```
 
-## API
+## API desplegada
 
-Todas las rutas usan el prefijo `/api`.
+Los consumidores usan las siguientes URLs de producción:
 
-| Método | Ruta | Descripción |
-| --- | --- | --- |
-| GET | `/health` | Comprueba la API y la conexión a PostgreSQL |
-| POST | `/measurements` | Inserta una lectura |
-| GET | `/measurements/latest` | Devuelve la lectura más reciente o `null` |
-| GET | `/measurements` | Devuelve historial paginado y filtrable |
+| Consumidor | Método | URL | Descripción |
+| --- | --- | --- | --- |
+| Cualquiera | GET | `https://kiqtzal-backend.vercel.app/api/health` | Comprueba la API y la conexión a PostgreSQL |
+| Python Collector | POST | `https://kiqtzal-backend.vercel.app/api/measurements` | Inserta una lectura recibida del ESP32 |
+| Frontend | GET | `https://kiqtzal-backend.vercel.app/api/measurements/latest` | Obtiene la lectura más reciente o `null` |
+| Frontend | GET | `https://kiqtzal-backend.vercel.app/api/measurements` | Obtiene historial paginado y filtrable |
 
-### Insertar una lectura
+El Collector solo utiliza el endpoint `POST`. El frontend solo utiliza los endpoints `GET` de lectura. Ninguno de los dos necesita conectarse directamente a Supabase ni conocer la contraseña de PostgreSQL.
+
+### Health check
+
+```bash
+curl https://kiqtzal-backend.vercel.app/api/health
+```
+
+Respuesta cuando el servicio y Supabase están disponibles:
+
+```json
+{
+  "status": "ok",
+  "database": "up",
+  "timestamp": "2026-09-25T09:33:20.980Z"
+}
+```
+
+Si PostgreSQL no responde, el endpoint devuelve HTTP `503` con `"database":"down"`.
+
+### Ingresar datos: solo Python Collector
+
+El Collector lee el JSON del ESP32 y envía un `POST` a la URL de producción:
 
 ```http
-POST /api/measurements
+POST https://kiqtzal-backend.vercel.app/api/measurements
 Content-Type: application/json
 ```
+
+Body:
 
 ```json
 {
@@ -78,9 +112,34 @@ Content-Type: application/json
 }
 ```
 
-Los seis campos son obligatorios y los nombres coinciden con la tabla. El collector no envía `id` ni `created_at`; PostgreSQL los genera.
+Los seis campos son obligatorios y sus nombres coinciden con la tabla. El Collector no envía `id` ni `created_at`; PostgreSQL los genera.
 
-Respuesta `201`:
+Ejemplo con `requests`:
+
+```python
+import requests
+
+API_URL = "https://kiqtzal-backend.vercel.app/api/measurements"
+
+
+def enviar_lectura(data):
+    payload = {
+        "temp_abajo": data["temp_abajo"],
+        "hum_abajo": data["hum_abajo"],
+        "mq_abajo_raw": data["mq_abajo_raw"],
+        "temp_arriba": data["temp_arriba"],
+        "hum_arriba": data["hum_arriba"],
+        "mq_arriba_raw": data["mq_arriba_raw"],
+    }
+
+    response = requests.post(API_URL, json=payload, timeout=10)
+    response.raise_for_status()
+    return response.json()
+```
+
+Si el ESP32 envía los sensores MQ como `mq_abajo` y `mq_arriba`, el Collector debe mapearlos a `mq_abajo_raw` y `mq_arriba_raw` antes del POST.
+
+Una lectura aceptada devuelve HTTP `201`:
 
 ```json
 {
@@ -95,17 +154,54 @@ Respuesta `201`:
 }
 ```
 
-### Consultar el historial
+Ante errores de red o respuestas `5xx`, el Collector debe conservar la lectura y reintentar con backoff exponencial. No se reintenta un `400`, porque significa que el payload es inválido.
+
+### Obtener información: solo frontend
+
+El frontend consulta exclusivamente los endpoints `GET` del despliegue. No debe enviar lecturas mediante el navegador.
+
+Última lectura:
+
+```js
+const API_BASE = 'https://kiqtzal-backend.vercel.app'
+
+const response = await fetch(`${API_BASE}/api/measurements/latest`)
+
+if (!response.ok) {
+  throw new Error(`Error ${response.status}`)
+}
+
+const latestMeasurement = await response.json()
+```
+
+`latestMeasurement` contiene el objeto de la última lectura o `null` cuando todavía no existen datos.
+
+Historial:
+
+```js
+const response = await fetch(
+  `${API_BASE}/api/measurements?limit=100&offset=0`,
+)
+
+if (!response.ok) {
+  throw new Error(`Error ${response.status}`)
+}
+
+const measurements = await response.json()
+```
+
+Historial por intervalo UTC:
 
 ```http
-GET /api/measurements?limit=100&offset=0
-GET /api/measurements?from=2026-09-25T00:00:00.000Z&to=2026-09-26T00:00:00.000Z
+GET https://kiqtzal-backend.vercel.app/api/measurements?from=2026-09-25T00:00:00.000Z&to=2026-09-26T00:00:00.000Z
 ```
+
+Parámetros disponibles:
 
 - `limit`: entero entre 1 y 500; valor inicial `100`.
 - `offset`: entero mayor o igual a 0; valor inicial `0`.
 - `from` y `to`: fechas ISO-8601 válidas; ambas son inclusivas.
-- El resultado siempre llega del más reciente al más antiguo.
+- El historial siempre llega del más reciente al más antiguo.
 
 ### Errores
 
@@ -125,18 +221,26 @@ Códigos principales: `INVALID_JSON` (400), `VALIDATION_ERROR` (400), `PAYLOAD_T
 
 `src/app.ts` exporta la aplicación Express por defecto para el despliegue zero-config de Vercel. `src/server.ts` se utiliza únicamente para arrancar el servidor local.
 
+La URL pública de producción es:
+
+```text
+https://kiqtzal-backend.vercel.app
+```
+
+Esta es la URL que deben usar el Python Collector y el frontend. Las URL generadas para previews o deployments temporales no deben configurarse en sus clientes.
+
 Antes de desplegar:
 
 1. Configura `DATABASE_URL` en Vercel sin incluir comillas en el valor secreto.
 2. Confirma que el proyecto usa Node.js 20.19 o superior.
 3. Despliega el repositorio.
-4. Verifica `GET /api/health`.
+4. Verifica `https://kiqtzal-backend.vercel.app/api/health`.
 
 No se usa almacenamiento local: todas las lecturas persisten en Supabase y sobreviven a reinicios y cold starts de Vercel.
 
 ## Collector
 
-El collector actual mostrado en el proyecto anterior conectaba directamente con PostgreSQL mediante `psycopg2`. Para usar este backend debe realizar un `POST HTTP` a `/api/measurements` y enviar los campos con los nombres exactos de la tabla, incluidos `mq_abajo_raw` y `mq_arriba_raw`.
+El collector actual mostrado en el proyecto anterior conectaba directamente con PostgreSQL mediante `psycopg2`. Para usar este backend debe realizar un `POST HTTP` a `https://kiqtzal-backend.vercel.app/api/measurements` y enviar los campos con los nombres exactos de la tabla, incluidos `mq_abajo_raw` y `mq_arriba_raw`.
 
 El contrato completo está en `docs/collector-contract.md`.
 
