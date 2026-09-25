@@ -1,54 +1,53 @@
 # Contrato del Python Collector
 
-Documento de referencia para el futuro repositorio `kiqtzal-collector`.
-Define **qué debe enviar** el collector a esta API. El collector NO vive en este
-repositorio ni en el frontend: es un proceso Python independiente que corre en la
-computadora donde está conectado el ESP32.
+El Collector lee por USB/Serial las líneas JSON enviadas por el ESP32 y las publica mediante HTTP en esta API. Es un proceso Python independiente que no está contenido en este repositorio.
 
-## Responsabilidades del collector
+## Flujo
 
-1. Leer por USB/Serial (pyserial) las líneas JSON enviadas por el ESP32.
-2. Parsear y validar mínimamente cada lectura.
-3. Enviar la lectura al backend con `POST /api/measurements`.
-4. Reintentar con backoff si el backend no responde (con buffer local para no perder lecturas).
-5. Configuración mediante variables de entorno (URL del backend, puerto serial, intervalo).
-
-## Flujo completo
-
-```
-ESP32 --USB/Serial--> Python Collector --HTTP--> Backend API --> Base de datos
+```text
+ESP32 --USB/Serial--> Python Collector --HTTP--> Vercel API --> Supabase PostgreSQL
 ```
 
-## Endpoint
+## Endpoint de escritura
 
-`POST {BACKEND_URL}/api/measurements`
+```http
+POST {BACKEND_URL}/api/measurements
+Content-Type: application/json
+```
 
-Headers:
-- `Content-Type: application/json`
+La API es pública y no requiere encabezado de autenticación.
 
-Body:
+## Body
 
 ```json
 {
-  "timestamp": "2026-01-01T12:00:00.000Z",
-  "gas": 42.7,
-  "humidity": 63.2,
-  "temperature": 24.8
+  "temp_abajo": 24.8,
+  "hum_abajo": 60.1,
+  "mq_abajo_raw": 120,
+  "temp_arriba": 25.3,
+  "hum_arriba": 58.4,
+  "mq_arriba_raw": 130
 }
 ```
 
-Campos:
-- `timestamp`: ISO-8601 con zona UTC (obligatorio).
-- `gas`: número finito (obligatorio).
-- `humidity`: número finito (obligatorio).
-- `temperature`: número finito (opcional; puede omitirse si el sensor no está presente).
+Los nombres deben coincidir exactamente con las columnas de `public.mediciones_aire`:
 
-Opcional futuro: `experimentId` (UUID) para asociar la lectura a un experimento activo.
+- `temp_abajo`, `hum_abajo` y `temp_arriba`, `hum_arriba`: números finitos.
+- `mq_abajo_raw` y `mq_arriba_raw`: enteros.
+- Los seis campos son obligatorios.
+- No se envían `id` ni `created_at`; la base de datos los genera.
+- No se aceptan campos adicionales.
 
 ## Respuestas
 
-- `201 Created` → medición aceptada y persistida (nuevo `id` en el body).
-- `400 Bad Request` → body inválido. Forma:
+- `201 Created`: la lectura fue insertada. El body incluye `id` y `created_at`.
+- `400 Bad Request`: JSON mal formado o valores inválidos.
+- `404 Not Found`: `BACKEND_URL` no apunta a esta API.
+- `413 Payload Too Large`: el body supera el límite aceptado.
+- `503 Service Unavailable`: Supabase no está disponible.
+- `500 Internal Server Error`: error interno; reintentar con backoff.
+
+Formato de error:
 
 ```json
 {
@@ -60,12 +59,19 @@ Opcional futuro: `experimentId` (UUID) para asociar la lectura a un experimento 
 }
 ```
 
-- `500 Internal Server Error` → error del servidor. Reintentar con backoff.
-- `404 Not Found` → ruta incorrecta (revisar `BACKEND_URL`).
+## Consultas para el frontend
 
-## Recomendaciones de implementación
+- `GET /api/measurements/latest`: última lectura o `null`.
+- `GET /api/measurements?limit=100&offset=0`: historial reciente.
+- `GET /api/measurements?from=...&to=...`: historial por intervalo UTC.
 
-- Leer el serial en bucle bloqueante con timeout, formato JSON por línea.
-- No enviar más de una medición por ~30 segundos (intervalo del sistema).
-- Ante fallo de red o 5xx: reintentar con backoff exponencial y guardar la lectura
-  pendiente en un buffer local (ej. archivo JSON) para reenviarla después.
+## Envío recomendado
+
+1. Leer una línea completa desde el puerto serial.
+2. Parsear el JSON recibido del ESP32.
+3. Mapear los nombres del ESP32 a los seis campos obligatorios.
+4. Enviar el body por HTTP al endpoint.
+5. Confirmar la lectura local solo cuando la API responda `201` o `4xx` no recuperable.
+6. Ante error de red o respuesta `5xx`, conservar la lectura y reintentar con backoff exponencial.
+
+El Collector no debe conectarse a PostgreSQL ni usar `psycopg2`; la conexión a la base de datos queda exclusivamente en el backend.

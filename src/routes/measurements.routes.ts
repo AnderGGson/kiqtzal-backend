@@ -3,5 +3,6 @@ import * as measurementController from '../controllers/measurements.controller.j
 
 export const measurementsRouter = Router()
 
-measurementsRouter.post('/', measurementController.postMeasurement)
+measurementsRouter.get('/', measurementController.getMeasurements)
 measurementsRouter.get('/latest', measurementController.getLatestMeasurement)
+measurementsRouter.post('/', measurementController.postMeasurement)

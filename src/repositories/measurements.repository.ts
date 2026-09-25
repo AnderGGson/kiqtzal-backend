@@ -1,56 +1,134 @@
-import { randomUUID } from 'node:crypto'
-import type { Measurement } from '../types/index.js'
+import type { Pool, QueryResultRow } from 'pg'
+import type { CreateMeasurementInput, Measurement } from '../types/index.js'
 
-interface CreateMeasurementInput {
-  experimentId: string | null
-  timestamp: string
-  gas: number
-  humidity: number
-  temperature: number | null
+interface MeasurementRow extends QueryResultRow {
+  id: number
+  temp_abajo: number | string
+  hum_abajo: number | string
+  mq_abajo_raw: number
+  temp_arriba: number | string
+  hum_arriba: number | string
+  mq_arriba_raw: number
+  created_at: Date | string
 }
 
-interface ListByExperimentFilters {
+export interface ListMeasurementsFilters {
   from?: string
   to?: string
-  after?: string
-  limit?: number
-  offset?: number
+  limit: number
+  offset: number
 }
 
-const measurements: Measurement[] = []
+const measurementColumns = `
+  id,
+  temp_abajo,
+  hum_abajo,
+  mq_abajo_raw,
+  temp_arriba,
+  hum_arriba,
+  mq_arriba_raw,
+  created_at AT TIME ZONE 'UTC' AS created_at
+`
 
-export function createMeasurementsRepository() {
+function toMeasurement(row: MeasurementRow): Measurement {
+  const createdAt = row.created_at instanceof Date ? row.created_at : new Date(row.created_at)
+
+  if (Number.isNaN(createdAt.getTime())) {
+    throw new Error('PostgreSQL devolvió una fecha de creación inválida')
+  }
+
   return {
-    create(input: CreateMeasurementInput): Measurement {
-      const measurement: Measurement = {
-        id: randomUUID(),
-        ...input,
+    id: row.id,
+    temp_abajo: Number(row.temp_abajo),
+    hum_abajo: Number(row.hum_abajo),
+    mq_abajo_raw: row.mq_abajo_raw,
+    temp_arriba: Number(row.temp_arriba),
+    hum_arriba: Number(row.hum_arriba),
+    mq_arriba_raw: row.mq_arriba_raw,
+    created_at: createdAt.toISOString(),
+  }
+}
+
+export function createMeasurementsRepository(pool: Pool) {
+  return {
+    async create(input: CreateMeasurementInput): Promise<Measurement> {
+      const result = await pool.query<MeasurementRow>(
+        `
+          INSERT INTO public.mediciones_aire (
+            temp_abajo,
+            hum_abajo,
+            mq_abajo_raw,
+            temp_arriba,
+            hum_arriba,
+            mq_arriba_raw
+          )
+          VALUES ($1, $2, $3, $4, $5, $6)
+          RETURNING
+            id,
+            temp_abajo,
+            hum_abajo,
+            mq_abajo_raw,
+            temp_arriba,
+            hum_arriba,
+            mq_arriba_raw,
+            created_at AT TIME ZONE 'UTC' AS created_at
+        `,
+        [
+          input.temp_abajo,
+          input.hum_abajo,
+          input.mq_abajo_raw,
+          input.temp_arriba,
+          input.hum_arriba,
+          input.mq_arriba_raw,
+        ],
+      )
+
+      return toMeasurement(result.rows[0])
+    },
+
+    async getLatest(): Promise<Measurement | null> {
+      const result = await pool.query<MeasurementRow>(`
+        SELECT ${measurementColumns}
+        FROM public.mediciones_aire
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `)
+
+      return result.rows[0] ? toMeasurement(result.rows[0]) : null
+    },
+
+    async list(filters: ListMeasurementsFilters): Promise<Measurement[]> {
+      const conditions: string[] = []
+      const values: unknown[] = []
+
+      if (filters.from) {
+        values.push(filters.from)
+        conditions.push(`(created_at AT TIME ZONE 'UTC') >= $${values.length}::timestamptz`)
       }
-      measurements.push(measurement)
-      return measurement
-    },
 
-    getLatest(): Measurement | null {
-      const latest = measurements
-        .slice()
-        .sort((a, b) => b.timestamp.localeCompare(a.timestamp))[0]
-      return latest ?? null
-    },
+      if (filters.to) {
+        values.push(filters.to)
+        conditions.push(`(created_at AT TIME ZONE 'UTC') <= $${values.length}::timestamptz`)
+      }
 
-    listByExperiment(experimentId: string, filters: ListByExperimentFilters = {}): Measurement[] {
-      let result = measurements.filter((measurement) => measurement.experimentId === experimentId)
+      values.push(filters.limit, filters.offset)
 
-      if (filters.from) result = result.filter((measurement) => measurement.timestamp >= filters.from!)
-      if (filters.to) result = result.filter((measurement) => measurement.timestamp <= filters.to!)
-      if (filters.after) result = result.filter((measurement) => measurement.timestamp > filters.after!)
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+      const limitPosition = values.length - 1
+      const offsetPosition = values.length
 
-      result.sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+      const result = await pool.query<MeasurementRow>(
+        `
+          SELECT ${measurementColumns}
+          FROM public.mediciones_aire
+          ${whereClause}
+          ORDER BY created_at DESC, id DESC
+          LIMIT $${limitPosition} OFFSET $${offsetPosition}
+        `,
+        values,
+      )
 
-      const offset = filters.offset ?? 0
-      const limit = filters.limit
-      return limit === undefined
-        ? result.slice(offset)
-        : result.slice(offset, offset + limit)
+      return result.rows.map(toMeasurement)
     },
   }
 }

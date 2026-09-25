@@ -1,215 +1,151 @@
 # K'iq'tzal — Backend
 
-API REST para el sistema de monitoreo del biopurificador K'iq'tzal.
-Repositorio **independiente** del frontend (`kiqtzal-frontend`) y del Python
-Collector. Recibe las mediciones del Collector, las valida, las guarda y las
-expone al frontend.
+API REST para recibir lecturas de aire del ESP32 mediante el Python Collector, guardarlas en PostgreSQL de Supabase y exponerlas al frontend.
 
 ## Requisitos
 
-- Node.js >= 20.19 (se usa Node 24)
+- Node.js >= 20.19
+- Una tabla `public.mediciones_aire` en Supabase
+
+## Configuración
+
+El backend carga automáticamente el archivo local `.env`, que está ignorado por Git y debe contener únicamente `DATABASE_URL` con el connection string de Supavisor en transaction mode.
+
+`DIRECT_URL` no se usa en la API; solo se necesita para migraciones.
+
+En Vercel agrega `DATABASE_URL` como variable de entorno secreta para Preview y Production. Nunca subas el `.env` al repositorio.
+
+## Base de datos
+
+La API utiliza esta tabla:
+
+```sql
+CREATE TABLE IF NOT EXISTS mediciones_aire (
+  id SERIAL PRIMARY KEY,
+  temp_abajo NUMERIC(5,2) NOT NULL,
+  hum_abajo NUMERIC(5,2) NOT NULL,
+  mq_abajo_raw INTEGER NOT NULL,
+  temp_arriba NUMERIC(5,2) NOT NULL,
+  hum_arriba NUMERIC(5,2) NOT NULL,
+  mq_arriba_raw INTEGER NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+Para expedite el historial se recomienda este índice opcional:
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_mediciones_aire_created_at
+ON public.mediciones_aire (created_at DESC, id DESC);
+```
 
 ## Comandos
 
 ```bash
-npm install        # instala dependencias
-npm run dev        # desarrollo con recarga automática (tsx watch src/server.ts)
-npm run build      # compila TypeScript a dist/
-npm run start      # ejecuta el build de producción (node dist/server.js)
-npm run typecheck  # TypeScript sin emitir
+npm install
+npm run dev
+npm run typecheck
+npm run build
+npm start
 ```
-
-## Configuración
-
-Copia `.env.example` a `.env`:
-
-```
-PORT=3001
-```
-
-Variables previstas para el futuro (pendientes de implementación): `DATABASE_URL`.
-Todo acceso a `process.env` ocurre en un único lugar: `src/config/env.ts`.
-
-## Estructura y responsabilidades
-
-```
-kiqtzal-backend/
-├── package.json              # scripts y dependencias
-├── tsconfig.json             # config TypeScript (NodeNext, strict)
-├── .env.example              # variables de entorno documentadas
-├── docs/
-│   └── collector-contract.md # contrato del POST del Python Collector
-├── src/
-│   ├── server.ts             # entrada: arranca el HTTP server en PORT
-│   ├── app.ts                # configura Express (cors, json, rutas, errores)
-│   ├── config/
-│   │   └── env.ts            # ÚNICO lugar que lee process.env
-│   ├── routes/               # SOLO definen URL + verbo + handler
-│   │   ├── index.ts              #     agrupa todo bajo /api (+ /health)
-│   │   ├── experiments.routes.ts #     GET / GET /:id / GET /:id/measurements
-│   │   └── measurements.routes.ts#     POST / y GET /latest
-│   ├── controllers/          # hablan con req/res: status codes y bodies
-│   │   ├── experiments.controller.ts
-│   │   └── measurements.controller.ts
-│   ├── services/             # reglas de negocio y validación
-│   │   ├── experiments.service.ts
-│   │   └── measurements.service.ts
-│   ├── repositories/         # acceso a datos (placeholders en memoria hoy)
-│   │   ├── db.ts                 #     define la interfaz Database y la instancia
-│   │   ├── experiments.repository.ts
-│   │   └── measurements.repository.ts
-│   ├── validation/           # esquemas Zod (contratos de entrada)
-│   │   ├── measurement.schema.ts
-│   │   └── experiment.schema.ts
-│   ├── middleware/           # manejo cross-cutting de la app
-│   │   ├── errorHandler.ts       #     errores Zod -> 400, resto -> 500
-│   │   └── notFound.ts           #     ruta desconocida -> 404
-│   ├── types/                # modelos de dominio (Experiment, Measurement)
-│   │   ├── experiment.ts
-│   │   ├── measurement.ts
-│   │   └── index.ts
-│   └── utils/
-│       └── query.ts          # parseo de query params (limit, offset, from, ...)
-```
-
-## Cómo viaja una petición por las capas
-
-Cada capa tiene **una sola responsabilidad**. Ejemplo con `GET /api/experiments/:id/measurements`:
-
-```
-routes (definen la URL)
-  └─ experiments.routes.ts  -> "GET /:id/measurements ejecuta getMeasurementsByExperiment"
-controllers (recolectan la petición)
-  └─ leen req.params.id y req.query.*, convierten a valores tipados
-services (reglas de negocio)
-  └─ verifican que el experimento exista; deciden qué datos pedir
-repositories (persistencia)
-  └─ consultan el almacenamiento y devuelven ModelMeasurement[]
-controllers (responden)
-  └─ 200 con el array, o 404 si el experimento no existe
-```
-
-| Capa | Qué hace | Qué NO hace |
-| ---- | -------- | ----------- |
-| `routes/` | mapa URL+verbo → handler | no tiene lógica |
-| `controllers/` | parsea entrada, setea status/body | no conoce la DB ni valida el dominio |
-| `services/` | validación y reglas de negocio | no sabe de HTTP ni de la DB concreta |
-| `repositories/` | persistencia (hoy: en memoria) | no conoce Express ni validación |
-| `validation/` | esquemas Zod reutilizados por services | sin efectos colaterales |
-
-## Persistencia: cómo se conectará una base de datos real después
-
-El **único** lugar que toca el almacenamiento es `src/repositories/`.
-
-- Hoy cada repositorio guarda en memoria (arrays). Todo está detrás de la interfaz
-  `Database` definida en `repositories/db.ts`.
-- Para migrar a SQLite (demo) o PostgreSQL (producción) solo hay que cambiar la
-  implementación de `experiments.repository.ts` y `measurements.repository.ts`
-  (añadir consultas reales y sus datos de conexión en `config/env.ts`).
-- `services`, `controllers` y `routes` **no se modifican**.
-- Los controladores son síncronos mientras los repositorios son en memoria;
-  cuando la persistencia sea real podrán ser `async` sin cambios extra en la
-  arquitectura: Express 5 reenvía automáticamente los `throw` de handlers
-  asíncronos al `errorHandler`.
 
 ## API
 
-Todas las rutas cuelgan del prefijo `/api` (definido en `src/config/env.ts`).
+Todas las rutas usan el prefijo `/api`.
 
 | Método | Ruta | Descripción |
-| ------ | ---- | ----------- |
-| GET | `/health` | estado del backend (`status`, `uptime`, `timestamp`) |
-| POST | `/measurements` | ingesta de medición (la usa el Python Collector) |
-| GET | `/measurements/latest` | última medición o `null` |
-| GET | `/experiments` | lista de experimentos (`limit`, `offset`) |
-| GET | `/experiments/:id` | detalle de experimento o 404 |
-| GET | `/experiments/:id/measurements` | mediciones del experimento |
+| --- | --- | --- |
+| GET | `/health` | Comprueba la API y la conexión a PostgreSQL |
+| POST | `/measurements` | Inserta una lectura |
+| GET | `/measurements/latest` | Devuelve la lectura más reciente o `null` |
+| GET | `/measurements` | Devuelve historial paginado y filtrable |
 
-Parámetros de consulta de mediciones: `from`, `to`, `after`, `limit`, `offset`.
-`after=<timestamp ISO>` trae solo lo registrado después de esa marca
-(polling incremental para el frontend).
+### Insertar una lectura
 
-`GET /api/measurements/latest` devuelve `null` cuando aún no hay mediciones;
-el frontend lo interpreta como "sin señal", sin depender del ESP32 ni del Collector.
-
-### Formato de errores
-
-Todos los errores se generan en el `errorHandler` central con la misma forma:
-
-```json
-{ "error": { "code": "...", "message": "..." } }
+```http
+POST /api/measurements
+Content-Type: application/json
 ```
-
-Códigos actuales: `VALIDATION_ERROR` (400, con `details` de Zod),
-`EXPERIMENT_NOT_FOUND` (404), `NOT_FOUND` (404), `INTERNAL_ERROR` (500).
-
-## Modelo de datos
-
-```ts
-Experiment {
-  id,                    // UUID (node:crypto)
-  name: string,
-  description: string | null,
-  mode: 'with-biopurifier' | 'without-biopurifier',   // provisional
-  startedAt: string,     // ISO-8601 UTC
-  endedAt: string | null,
-  createdAt: string,
-  updatedAt: string
-}
-
-Measurement {
-  id,                    // UUID
-  experimentId: string | null,   // provisional: lecturas iniciales sin experimento
-  timestamp: string,     // ISO-8601 UTC
-  gas: number,
-  humidity: number,
-  temperature: number | null     // el sensor de temperatura aún es opcional
-}
-```
-
-- Fechas: siempre ISO-8601 en UTC, como strings.
-- Unidades de gas/humedad/temperatura: **por definir** con los sensores reales;
-  los valores se almacenan crudos, sin conversiones ni rangos inventados.
-
-## POST /api/measurements (ingesta)
-
-Body esperado del Python Collector (contrato completo en `docs/collector-contract.md`):
 
 ```json
 {
-  "timestamp": "2026-01-01T12:00:00.000Z",
-  "gas": 42.7,
-  "humidity": 63.2,
-  "temperature": 24.8
+  "temp_abajo": 24.8,
+  "hum_abajo": 60.1,
+  "mq_abajo_raw": 120,
+  "temp_arriba": 25.3,
+  "hum_arriba": 58.4,
+  "mq_arriba_raw": 130
 }
 ```
 
-- `temperature` es opcional. `experimentId` (UUID) es opcional por ahora.
-- Validado con Zod (`src/validation/measurement.schema.ts`).
-- Respuestas: `201` con la medición creada, o `400` con el detalle de validación.
+Los seis campos son obligatorios y los nombres coinciden con la tabla. El collector no envía `id` ni `created_at`; PostgreSQL los genera.
 
-## El Python Collector (fuera de este repo)
+Respuesta `201`:
 
-El Collector corre en la computadora conectada por USB al ESP32, es un proceso
-Python independiente y **no vive en este repositorio ni en el frontend**.
-Su único punto de contacto con este proyecto es el endpoint `POST /api/measurements`.
-Su forma de hablar está definida en `docs/collector-contract.md`.
-
+```json
+{
+  "id": 123,
+  "temp_abajo": 24.8,
+  "hum_abajo": 60.1,
+  "mq_abajo_raw": 120,
+  "temp_arriba": 25.3,
+  "hum_arriba": 58.4,
+  "mq_arriba_raw": 130,
+  "created_at": "2026-09-25T12:00:00.000Z"
+}
 ```
-ESP32 --USB/Serial--> Python Collector --HTTP--> Backend API --> Base de datos
+
+### Consultar el historial
+
+```http
+GET /api/measurements?limit=100&offset=0
+GET /api/measurements?from=2026-09-25T00:00:00.000Z&to=2026-09-26T00:00:00.000Z
 ```
 
-## Cómo añadir un endpoint (receta)
+- `limit`: entero entre 1 y 500; valor inicial `100`.
+- `offset`: entero mayor o igual a 0; valor inicial `0`.
+- `from` y `to`: fechas ISO-8601 válidas; ambas son inclusivas.
+- El resultado siempre llega del más reciente al más antiguo.
 
-1. `types/`: define o reutiliza el modelo.
-2. `repositories/`: añade el método de acceso a datos (y el que corresponda en `db.ts` si hace falta).
-3. `services/`: añade la función de negocio que lo usa.
-4. `controllers/`: crea el handler (lee `req`, escribe `res/status`).
-5. `routes/`: enlaza verbo+URL con el handler.
-6. Actualiza la tabla de API de este README.
+### Errores
 
-## Decisiones pendientes (provisionales)
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Datos inválidos",
+    "details": []
+  }
+}
+```
 
-- Base de datos: SQLite para la demo; la interfaz de repositorios ya está lista para PostgreSQL.
-- Asociación de mediciones a experimentos: cómo el Collector indicará el experimento activo.
-- Unidades y rangos de sensores, según los sensores reales a definir.
+Códigos principales: `INVALID_JSON` (400), `VALIDATION_ERROR` (400), `PAYLOAD_TOO_LARGE` (413), `NOT_FOUND` (404), `DATABASE_UNAVAILABLE` (503) e `INTERNAL_ERROR` (500).
+
+## Vercel
+
+`src/app.ts` exporta la aplicación Express por defecto para el despliegue zero-config de Vercel. `src/server.ts` se utiliza únicamente para arrancar el servidor local.
+
+Antes de desplegar:
+
+1. Configura `DATABASE_URL` en Vercel sin incluir comillas en el valor secreto.
+2. Confirma que el proyecto usa Node.js 20.19 o superior.
+3. Despliega el repositorio.
+4. Verifica `GET /api/health`.
+
+No se usa almacenamiento local: todas las lecturas persisten en Supabase y sobreviven a reinicios y cold starts de Vercel.
+
+## Collector
+
+El collector actual mostrado en el proyecto anterior conectaba directamente con PostgreSQL mediante `psycopg2`. Para usar este backend debe realizar un `POST HTTP` a `/api/measurements` y enviar los campos con los nombres exactos de la tabla, incluidos `mq_abajo_raw` y `mq_arriba_raw`.
+
+El contrato completo está en `docs/collector-contract.md`.
+
+## Estructura
+
+- `src/app.ts`: configuración de Express y exportación para Vercel.
+- `src/server.ts`: listener local.
+- `src/routes`: rutas HTTP.
+- `src/controllers`: traducción entre HTTP y servicios.
+- `src/services`: validación y reglas.
+- `src/repositories`: acceso parametrizado a PostgreSQL.
+- `src/config/env.ts`: lectura y validación de variables de entorno.
