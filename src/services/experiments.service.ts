@@ -1,32 +1,20 @@
 import { database } from '../repositories/db.js'
+import type { ListParams, MeasurementFilters } from '../repositories/types.js'
 import type { Experiment, Measurement } from '../types/index.js'
 
-interface ListExperimentsParams {
-  limit?: number
-  offset?: number
-}
-
-type ListMeasurementsParams = {
-  from?: string
-  to?: string
-  after?: string
-  limit?: number
-  offset?: number
-}
-
-export function listExperiments(params: ListExperimentsParams = {}): Experiment[] {
+export async function listExperiments(params: ListParams = {}): Promise<Experiment[]> {
   return database.experiments.list(params)
 }
 
-export function getExperimentById(id: string): Experiment | null {
+export async function getExperimentById(id: string): Promise<Experiment | null> {
   return database.experiments.findById(id)
 }
 
-export function getMeasurementsByExperiment(
+export async function getMeasurementsByExperiment(
   id: string,
-  params: ListMeasurementsParams = {},
-): Measurement[] | null {
-  const experiment = database.experiments.findById(id)
+  params: MeasurementFilters = {},
+): Promise<Measurement[] | null> {
+  const experiment = await database.experiments.findById(id)
   if (!experiment) return null
   return database.measurements.listByExperiment(id, params)
 }

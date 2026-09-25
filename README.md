@@ -1,13 +1,24 @@
 # K'iq'tzal — Backend
 
 API REST para el sistema de monitoreo del biopurificador K'iq'tzal.
-Repositorio **independiente** del frontend (`kiqtzal-frontend`) y del Python
-Collector. Recibe las mediciones del Collector, las valida, las guarda y las
-expone al frontend.
+Repositorio **independiente** del frontend (`kiqtzal-frontend`). Recibe las mediciones
+del ESP32 (el propio firmware hace HTTP directo, sin collector Python), las valida,
+las guarda en PostgreSQL y las expone al frontend.
+
+Documentos clave:
+
+- `docs/collector-contract.md` — contrato del `POST` que hace el firmware.
+- `docs/firmware-guide.md` — cableado de sensores + sketch de referencia para la IA del compañero.
+- `docs/deployment.md` — despliegue (Neon, Render, Vercel) y checklist de la demo.
+
+> **⛅ Entregado por @jorge (25/09/2026).** Si vas a continuar esta tarea,
+> arranca por [`PASOS_SIGUIENTES.md`](./PASOS_SIGUIENTES.md): es el checklist
+> completo de lo que falta (Neon → Render → Vercel → firmware), con todo
+> verificado localmente.
 
 ## Requisitos
 
-- Node.js >= 20.19 (se usa Node 24)
+- Node.js >= 20 (se usa Node 24).
 
 ## Comandos
 
@@ -17,6 +28,17 @@ npm run dev        # desarrollo con recarga automática (tsx watch src/server.ts
 npm run build      # compila TypeScript a dist/
 npm run start      # ejecuta el build de producción (node dist/server.js)
 npm run typecheck  # TypeScript sin emitir
+npm run simulate   # emite lecturas simuladas (para desarrollar sin sensores)
+```
+
+### Simulador
+
+```bash
+npm run simulate                                # 1 lectura cada 5 s a localhost:3001 (se detiene con Ctrl+C)
+npm run simulate -- --backfill 500              # precarga 500 lecturas y termina
+npm run simulate -- --backfill 500 --live       # precarga 500 lecturas y sigue en tiempo real
+npm run simulate -- --url https://tu-backend/api --interval 3000
+npm run simulate -- --backfill 300 --hours 2    # historial repartido en 2 h
 ```
 
 ## Configuración
@@ -25,191 +47,116 @@ Copia `.env.example` a `.env`:
 
 ```
 PORT=3001
+DATABASE_DRIVER=memory            # 'memory' (dev) | 'postgres' (producción)
+# DATABASE_URL=postgresql://...   # obligatorio con DATABASE_DRIVER=postgres
+# DATABASE_SSL=true               # Neon requiere TLS, ponlo en 'true' en producción
 ```
 
-Variables previstas para el futuro (pendientes de implementación): `DATABASE_URL`.
 Todo acceso a `process.env` ocurre en un único lugar: `src/config/env.ts`.
 
 ## Estructura y responsabilidades
 
 ```
 kiqtzal-backend/
-├── package.json              # scripts y dependencias
-├── tsconfig.json             # config TypeScript (NodeNext, strict)
-├── .env.example              # variables de entorno documentadas
+├── package.json
+├── tsconfig.json
+├── .env.example
 ├── docs/
-│   └── collector-contract.md # contrato del POST del Python Collector
+│   ├── collector-contract.md  # contrato del POST del firmware
+│   ├── firmware-guide.md      # sensores, pines y sketch (.ino)
+│   └── deployment.md          # desplegar backend/frontend + demo
+├── tools/
+│   └── firmware/kiqtzal-firmware/kiqtzal-firmware.ino  # sketch de referencia
 ├── src/
-│   ├── server.ts             # entrada: arranca el HTTP server en PORT
-│   ├── app.ts                # configura Express (cors, json, rutas, errores)
+│   ├── server.ts          # entrada: inicializa la DB y arranca el HTTP server
+│   ├── app.ts             # Express (cors, json, api, SPA opcional, errores)
 │   ├── config/
-│   │   └── env.ts            # ÚNICO lugar que lee process.env
-│   ├── routes/               # SOLO definen URL + verbo + handler
-│   │   ├── index.ts              #     agrupa todo bajo /api (+ /health)
-│   │   ├── experiments.routes.ts #     GET / GET /:id / GET /:id/measurements
-│   │   └── measurements.routes.ts#     POST / y GET /latest
-│   ├── controllers/          # hablan con req/res: status codes y bodies
-│   │   ├── experiments.controller.ts
-│   │   └── measurements.controller.ts
-│   ├── services/             # reglas de negocio y validación
-│   │   ├── experiments.service.ts
-│   │   └── measurements.service.ts
-│   ├── repositories/         # acceso a datos (placeholders en memoria hoy)
-│   │   ├── db.ts                 #     define la interfaz Database y la instancia
-│   │   ├── experiments.repository.ts
-│   │   └── measurements.repository.ts
-│   ├── validation/           # esquemas Zod (contratos de entrada)
-│   │   ├── measurement.schema.ts
-│   │   └── experiment.schema.ts
-│   ├── middleware/           # manejo cross-cutting de la app
-│   │   ├── errorHandler.ts       #     errores Zod -> 400, resto -> 500
-│   │   └── notFound.ts           #     ruta desconocida -> 404
-│   ├── types/                # modelos de dominio (Experiment, Measurement)
-│   │   ├── experiment.ts
-│   │   ├── measurement.ts
-│   │   └── index.ts
-│   └── utils/
-│       └── query.ts          # parseo de query params (limit, offset, from, ...)
+│   │   └── env.ts         # ÚNICO lugar que lee process.env
+│   ├── routes/            # SOLO definen URL + verbo + handler
+│   │   ├── index.ts                 # /api + /health
+│   │   ├── experiments.routes.ts    # GET / GET /:id / GET /:id/measurements
+│   │   └── measurements.routes.ts   # POST / GET / GET /latest
+│   ├── controllers/       # hablan con req/res: status codes y bodies
+│   ├── services/          # reglas de negocio y validación (async)
+│   ├── repositories/
+│   │   ├── types.ts           # interfaces de repositorios (los drivers las cumplen)
+│   │   ├── db.ts              # instancia la Database según DATABASE_DRIVER
+│   │   ├── memory/            # driver en memoria (desarrollo, sin instalar nada)
+│   │   └── postgres/          # driver PostgreSQL (producción) + creación de tablas
+│   ├── validation/         # esquemas Zod (contratos de entrada)
+│   ├── middleware/         # errorHandler y notFound
+│   ├── types/              # modelos de dominio
+│   └── utils/query.ts      # parseo de query params
+└── scripts… (simulate en src/scripts/simulate.ts)
 ```
 
-## Cómo viaja una petición por las capas
+## Persistencia
 
-Cada capa tiene **una sola responsabilidad**. Ejemplo con `GET /api/experiments/:id/measurements`:
-
-```
-routes (definen la URL)
-  └─ experiments.routes.ts  -> "GET /:id/measurements ejecuta getMeasurementsByExperiment"
-controllers (recolectan la petición)
-  └─ leen req.params.id y req.query.*, convierten a valores tipados
-services (reglas de negocio)
-  └─ verifican que el experimento exista; deciden qué datos pedir
-repositories (persistencia)
-  └─ consultan el almacenamiento y devuelven ModelMeasurement[]
-controllers (responden)
-  └─ 200 con el array, o 404 si el experimento no existe
-```
-
-| Capa | Qué hace | Qué NO hace |
-| ---- | -------- | ----------- |
-| `routes/` | mapa URL+verbo → handler | no tiene lógica |
-| `controllers/` | parsea entrada, setea status/body | no conoce la DB ni valida el dominio |
-| `services/` | validación y reglas de negocio | no sabe de HTTP ni de la DB concreta |
-| `repositories/` | persistencia (hoy: en memoria) | no conoce Express ni validación |
-| `validation/` | esquemas Zod reutilizados por services | sin efectos colaterales |
-
-## Persistencia: cómo se conectará una base de datos real después
-
-El **único** lugar que toca el almacenamiento es `src/repositories/`.
-
-- Hoy cada repositorio guarda en memoria (arrays). Todo está detrás de la interfaz
-  `Database` definida en `repositories/db.ts`.
-- Para migrar a SQLite (demo) o PostgreSQL (producción) solo hay que cambiar la
-  implementación de `experiments.repository.ts` y `measurements.repository.ts`
-  (añadir consultas reales y sus datos de conexión en `config/env.ts`).
-- `services`, `controllers` y `routes` **no se modifican**.
-- Los controladores son síncronos mientras los repositorios son en memoria;
-  cuando la persistencia sea real podrán ser `async` sin cambios extra en la
-  arquitectura: Express 5 reenvía automáticamente los `throw` de handlers
-  asíncronos al `errorHandler`.
+- El **único** lugar que toca el almacenamiento es `src/repositories/`.
+- `DATABASE_DRIVER=memory` → datos en memoria (se pierden al reiniciar). Útil para desarrollo.
+- `DATABASE_DRIVER=postgres` → usa `DATABASE_URL` y crea las tablas al arrancar
+  (`CREATE TABLE IF NOT EXISTS`). Es el modo de producción (Render + Neon).
+- `services`, `controllers` y `routes` no cambian entre drivers: todos son `async`
+  y Express 5 reenvía los `throw` de handlers asíncronos al `errorHandler`.
 
 ## API
 
-Todas las rutas cuelgan del prefijo `/api` (definido en `src/config/env.ts`).
+Todas las rutas cuelgan del prefijo `/api`.
 
 | Método | Ruta | Descripción |
 | ------ | ---- | ----------- |
 | GET | `/health` | estado del backend (`status`, `uptime`, `timestamp`) |
-| POST | `/measurements` | ingesta de medición (la usa el Python Collector) |
-| GET | `/measurements/latest` | última medición o `null` |
+| POST | `/measurements` | ingesta de medición (la usa el firmware del ESP32) |
+| GET | `/measurements` | historial (`from`, `to`, `after`, `limit`, `offset`) |
+| GET | `/measurements/latest` | última medición combinada o `null` |
 | GET | `/experiments` | lista de experimentos (`limit`, `offset`) |
 | GET | `/experiments/:id` | detalle de experimento o 404 |
 | GET | `/experiments/:id/measurements` | mediciones del experimento |
 
-Parámetros de consulta de mediciones: `from`, `to`, `after`, `limit`, `offset`.
-`after=<timestamp ISO>` trae solo lo registrado después de esa marca
-(polling incremental para el frontend).
-
-`GET /api/measurements/latest` devuelve `null` cuando aún no hay mediciones;
-el frontend lo interpreta como "sin señal", sin depender del ESP32 ni del Collector.
-
-### Formato de errores
-
-Todos los errores se generan en el `errorHandler` central con la misma forma:
-
-```json
-{ "error": { "code": "...", "message": "..." } }
-```
-
-Códigos actuales: `VALIDATION_ERROR` (400, con `details` de Zod),
+Errores: siempre `{ "error": { "code", "message" } }`. Códigos: `VALIDATION_ERROR` (400),
 `EXPERIMENT_NOT_FOUND` (404), `NOT_FOUND` (404), `INTERNAL_ERROR` (500).
 
 ## Modelo de datos
 
 ```ts
-Experiment {
-  id,                    // UUID (node:crypto)
-  name: string,
-  description: string | null,
-  mode: 'with-biopurifier' | 'without-biopurifier',   // provisional
-  startedAt: string,     // ISO-8601 UTC
-  endedAt: string | null,
-  createdAt: string,
-  updatedAt: string
+Reading {
+  gas: number          // ADC crudo del MQ-135 (0–4095)
+  humidity: number     // % HR (DHT11)
+  temperature: number | null  // °C (DHT11)
 }
 
 Measurement {
-  id,                    // UUID
-  experimentId: string | null,   // provisional: lecturas iniciales sin experimento
-  timestamp: string,     // ISO-8601 UTC
-  gas: number,
-  humidity: number,
-  temperature: number | null     // el sensor de temperatura aún es opcional
+  id: string           // UUID
+  experimentId: string | null
+  timestamp: string    // ISO-8601 UTC (hora del servidor si el firmware no manda)
+  dirtyAir: Reading    // entrada del biofiltro (aire sucio)
+  cleanAir: Reading    // salida del biofiltro (aire limpio)
 }
 ```
 
-- Fechas: siempre ISO-8601 en UTC, como strings.
-- Unidades de gas/humedad/temperatura: **por definir** con los sensores reales;
-  los valores se almacenan crudos, sin conversiones ni rangos inventados.
-
-## POST /api/measurements (ingesta)
-
-Body esperado del Python Collector (contrato completo en `docs/collector-contract.md`):
+## POST /api/measurements
 
 ```json
 {
-  "timestamp": "2026-01-01T12:00:00.000Z",
-  "gas": 42.7,
-  "humidity": 63.2,
-  "temperature": 24.8
+  "dirtyAir": { "gas": 512.3, "humidity": 65.1, "temperature": 24.8 },
+  "cleanAir": { "gas": 402.7, "humidity": 63.9, "temperature": 25.1 }
 }
 ```
 
-- `temperature` es opcional. `experimentId` (UUID) es opcional por ahora.
+- `timestamp` y `experimentId` son opcionales. `temperature` es opcional por canal.
 - Validado con Zod (`src/validation/measurement.schema.ts`).
 - Respuestas: `201` con la medición creada, o `400` con el detalle de validación.
-
-## El Python Collector (fuera de este repo)
-
-El Collector corre en la computadora conectada por USB al ESP32, es un proceso
-Python independiente y **no vive en este repositorio ni en el frontend**.
-Su único punto de contacto con este proyecto es el endpoint `POST /api/measurements`.
-Su forma de hablar está definida en `docs/collector-contract.md`.
-
-```
-ESP32 --USB/Serial--> Python Collector --HTTP--> Backend API --> Base de datos
-```
 
 ## Cómo añadir un endpoint (receta)
 
 1. `types/`: define o reutiliza el modelo.
-2. `repositories/`: añade el método de acceso a datos (y el que corresponda en `db.ts` si hace falta).
+2. `repositories/`: añade el método en las interfaces (`types.ts`) y en ambos drivers (memory/postgres).
 3. `services/`: añade la función de negocio que lo usa.
 4. `controllers/`: crea el handler (lee `req`, escribe `res/status`).
 5. `routes/`: enlaza verbo+URL con el handler.
 6. Actualiza la tabla de API de este README.
 
-## Decisiones pendientes (provisionales)
+## El firmware (fuera de este repo)
 
-- Base de datos: SQLite para la demo; la interfaz de repositorios ya está lista para PostgreSQL.
-- Asociación de mediciones a experimentos: cómo el Collector indicará el experimento activo.
-- Unidades y rangos de sensores, según los sensores reales a definir.
+El ESP32 con los sensores lee y postea solo. Su contrato está en
+`docs/collector-contract.md` y el sketch de referencia en `tools/firmware/`.

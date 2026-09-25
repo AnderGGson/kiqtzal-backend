@@ -1,22 +1,13 @@
-# Contrato del Python Collector
+# Contrato del POST (Firmware ESP32)
 
-Documento de referencia para el futuro repositorio `kiqtzal-collector`.
-Define **qué debe enviar** el collector a esta API. El collector NO vive en este
-repositorio ni en el frontend: es un proceso Python independiente que corre en la
-computadora donde está conectado el ESP32.
-
-## Responsabilidades del collector
-
-1. Leer por USB/Serial (pyserial) las líneas JSON enviadas por el ESP32.
-2. Parsear y validar mínimamente cada lectura.
-3. Enviar la lectura al backend con `POST /api/measurements`.
-4. Reintentar con backoff si el backend no responde (con buffer local para no perder lecturas).
-5. Configuración mediante variables de entorno (URL del backend, puerto serial, intervalo).
+Documento de referencia para el firmware que corre en el ESP32 con los sensores.
+A diferencia de versiones anteriores, **no hay collector Python**: el propio ESP32
+habla HTTP directo con esta API. Ver `docs/firmware-guide.md` para el cableado y los pines.
 
 ## Flujo completo
 
 ```
-ESP32 --USB/Serial--> Python Collector --HTTP--> Backend API --> Base de datos
+ESP32 (2x MQ-135 + 2x DHT11) --HTTP POST--> Backend API (Render) --> PostgreSQL (Neon)
 ```
 
 ## Endpoint
@@ -26,24 +17,22 @@ ESP32 --USB/Serial--> Python Collector --HTTP--> Backend API --> Base de datos
 Headers:
 - `Content-Type: application/json`
 
-Body:
+Body (una lectura por ciclo):
 
 ```json
 {
   "timestamp": "2026-01-01T12:00:00.000Z",
-  "gas": 42.7,
-  "humidity": 63.2,
-  "temperature": 24.8
+  "dirtyAir": { "gas": 512.3, "humidity": 65.1, "temperature": 24.8 },
+  "cleanAir": { "gas": 402.7, "humidity": 63.9, "temperature": 25.1 }
 }
 ```
 
 Campos:
-- `timestamp`: ISO-8601 con zona UTC (obligatorio).
-- `gas`: número finito (obligatorio).
-- `humidity`: número finito (obligatorio).
-- `temperature`: número finito (opcional; puede omitirse si el sensor no está presente).
-
-Opcional futuro: `experimentId` (UUID) para asociar la lectura a un experimento activo.
+- `timestamp`: ISO-8601 UTC (opcional). Si se omite, el backend usa la hora del servidor al recibir. Recomendado omitirlo si el ESP32 no tiene NTP.
+- `dirtyAir`: lectura de los sensores de la **entrada** del biofiltro (aire sucio).
+- `cleanAir`: lectura de los sensores de la **salida** del biofiltro (aire limpio).
+- Por canal: `gas` (número finito, obligatorio), `humidity` (obligatorio), `temperature` (opcional).
+- `experimentId` (UUID, opcional) para asociar la lectura a un experimento.
 
 ## Respuestas
 
@@ -52,20 +41,23 @@ Opcional futuro: `experimentId` (UUID) para asociar la lectura a un experimento 
 
 ```json
 {
-  "error": {
-    "code": "VALIDATION_ERROR",
-    "message": "Datos inválidos",
-    "details": []
-  }
+  "error": { "code": "VALIDATION_ERROR", "message": "Datos inválidos", "details": [] }
 }
 ```
 
-- `500 Internal Server Error` → error del servidor. Reintentar con backoff.
 - `404 Not Found` → ruta incorrecta (revisar `BACKEND_URL`).
+- `5xx` → error del servidor; reintentar en el siguiente ciclo.
 
-## Recomendaciones de implementación
+## Lectura
 
-- Leer el serial en bucle bloqueante con timeout, formato JSON por línea.
-- No enviar más de una medición por ~30 segundos (intervalo del sistema).
-- Ante fallo de red o 5xx: reintentar con backoff exponencial y guardar la lectura
-  pendiente en un buffer local (ej. archivo JSON) para reenviarla después.
+- `GET /api/measurements/latest` → última medición combinada o `null` (sin señal).
+- `GET /api/measurements?from&to&after&limit` → historial reciente (para las gráficas).
+  - `after=<timestamp ISO>` trae solo lo registrado después de esa marca (polling incremental).
+
+## Recomendaciones de implementación (firmware)
+
+- Leer cada canal promediando ~10 muestras del ADC (`gas`) para estabilizar el ruido.
+- Intervalo de ciclo: 5 segundos.
+- Si un `POST` falla, reintentar en el siguiente ciclo; la lectura más nueva es la que importa.
+- `timestamp`: omitirlo (el backend pone la hora), o sincronizar NTP si se quiere el dato exacto.
+- Sketch de referencia completo en `tools/firmware/kiqtzal-firmware/kiqtzal-firmware.ino`.

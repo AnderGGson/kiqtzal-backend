@@ -1,18 +1,12 @@
 import { randomUUID } from 'node:crypto'
-import type { Experiment, ExperimentMode } from '../types/index.js'
-
-interface CreateExperimentInput {
-  name: string
-  description?: string | null
-  mode: ExperimentMode
-  startedAt: string
-}
+import type { Experiment } from '../../types/index.js'
+import type { CreateExperimentInput, ExperimentsRepository, ListParams } from '../types.js'
 
 const experiments: Experiment[] = []
 
-export function createExperimentsRepository() {
+export function createMemoryExperimentsRepository(): ExperimentsRepository {
   return {
-    list(params: { limit?: number; offset?: number } = {}): Experiment[] {
+    async list(params: ListParams = {}): Promise<Experiment[]> {
       const offset = params.offset ?? 0
       const limit = params.limit
       return limit === undefined
@@ -20,11 +14,11 @@ export function createExperimentsRepository() {
         : experiments.slice(offset, offset + limit)
     },
 
-    findById(id: string): Experiment | null {
+    async findById(id: string): Promise<Experiment | null> {
       return experiments.find((experiment) => experiment.id === id) ?? null
     },
 
-    create(input: CreateExperimentInput): Experiment {
+    async create(input: CreateExperimentInput): Promise<Experiment> {
       const now = new Date().toISOString()
       const experiment: Experiment = {
         id: randomUUID(),
